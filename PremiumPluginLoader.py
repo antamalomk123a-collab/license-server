@@ -27,7 +27,8 @@ import os
 
 PLUGIN_NAME = 'PremiumPluginLoader'
 VERSION = '1.0'
-SERVER_URL = 'https://license-server-production-a52e.up.railway.app'.rstrip('/')
+# ضع رابط سيرفرك HTTPS هنا قبل إرسال الملف للعميل.
+SERVER_URL = 'https://YOUR-SERVER.up.railway.app'.rstrip('/')
 LOGIN_URL = SERVER_URL + '/api/login'
 PLUGINS_URL = SERVER_URL + '/api/plugins'
 HEARTBEAT_URL = SERVER_URL + '/api/heartbeat'
