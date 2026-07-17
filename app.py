@@ -1,6 +1,8 @@
 """Railway license server + protected Premium plugin catalog."""
+import base64
 import hashlib
 import os
+import zlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -13,7 +15,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base
 from passlib.hash import bcrypt
 
 DB_URL = os.environ.get("DATABASE_URL", "sqlite:///./licenses.db")
-JWT_SECRET = os.environ.get("JWT_SECRET", secrets.token_hex(32))
+JWT_SECRET = os.environ.get("JWT_SECRET")
 ADMIN_KEY = os.environ.get("ADMIN_KEY")
 SESSION_HOURS = 6
 # true = every active subscriber gets the Premium catalog for now.
@@ -21,6 +23,8 @@ PREMIUM_FOR_ALL = os.environ.get("PREMIUM_FOR_ALL", "true").lower() == "true"
 
 if not ADMIN_KEY:
     raise RuntimeError("Set ADMIN_KEY in Railway Variables before deploying.")
+if not JWT_SECRET:
+    raise RuntimeError("Set JWT_SECRET in Railway Variables before deploying.")
 
 BASE_DIR = Path(__file__).resolve().parent
 PLUGINS_DIR = BASE_DIR / "plugins"
@@ -72,17 +76,21 @@ def require_admin(x_admin_key: str = Header(...)):
         raise HTTPException(403, "invalid_admin_key")
 
 def make_token(user):
-    return jwt.encode({"uid": user.id, "username": user.username,
+    # Bind the JWT to the HWID that was accepted during login.
+    return jwt.encode({"uid": user.id, "username": user.username, "hwid": user.hwid,
                        "exp": datetime.now(timezone.utc) + timedelta(hours=SESSION_HOURS)},
                       JWT_SECRET, algorithm="HS256")
 
-def token_user(token, db):
+def token_user(token, hwid, db):
     try:
         data = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
     except jwt.PyJWTError:
         raise HTTPException(401, "invalid_session")
     user = db.get(User, data.get("uid"))
-    if not user:
+    # A stolen token cannot be used from another installation. Checking both
+    # the signed claim and the current database value invalidates sessions
+    # after an admin resets the user's HWID.
+    if not user or not hwid or data.get("hwid") != hwid or user.hwid != hwid:
         raise HTTPException(401, "invalid_session")
     return user
 
@@ -116,6 +124,7 @@ class LoginRequest(BaseModel):
     hwid: str
 class TokenRequest(BaseModel):
     session_token: str
+    hwid: str
 class CreateUserRequest(BaseModel):
     username: str
     password: str
@@ -144,20 +153,20 @@ def login(req: LoginRequest, db=Depends(get_db)):
 
 @app.post("/api/heartbeat")
 def heartbeat(req: TokenRequest, db=Depends(get_db)):
-    user = token_user(req.session_token, db)
+    user = token_user(req.session_token, req.hwid, db)
     ensure_active(user)
     return {"status": "ok", "subscription_end": user.subscription_end.isoformat(),
             "plan": "Premium", "features": {"premium": True}, "plugins": allowed_plugins(user)}
 
 @app.post("/api/plugins")
 def plugin_list(req: TokenRequest, db=Depends(get_db)):
-    user = token_user(req.session_token, db)
+    user = token_user(req.session_token, req.hwid, db)
     ensure_active(user)
     return {"status": "ok", "plan": "Premium", "plugins": allowed_plugins(user)}
 
 @app.post("/api/plugins/{plugin_id}")
 def download_plugin(plugin_id: str, req: TokenRequest, db=Depends(get_db)):
-    user = token_user(req.session_token, db)
+    user = token_user(req.session_token, req.hwid, db)
     ensure_active(user)
     item = PLUGIN_CATALOG.get(plugin_id)
     if not item:
@@ -167,10 +176,14 @@ def download_plugin(plugin_id: str, req: TokenRequest, db=Depends(get_db)):
     path = PLUGINS_DIR / item["filename"]
     if not path.is_file():
         raise HTTPException(503, "plugin_file_missing")
-    source = path.read_text(encoding="utf-8-sig")
+    # The client receives a compressed transport payload and never writes it
+    # as a .py file. SHA-256 is calculated on the exact uncompressed UTF-8
+    # bytes that the client will compile.
+    source_bytes = path.read_text(encoding="utf-8-sig").encode("utf-8")
+    payload_b64 = base64.b64encode(zlib.compress(source_bytes, level=9)).decode("ascii")
     return {"status": "ok", "id": plugin_id, "name": item["name"],
-            "version": item["version"], "source": source,
-            "sha256": hashlib.sha256(source.encode("utf-8")).hexdigest()}
+            "version": item["version"], "payload_b64": payload_b64,
+            "sha256": hashlib.sha256(source_bytes).hexdigest()}
 
 # Admin API
 @app.post("/api/admin/users", dependencies=[Depends(require_admin)])
